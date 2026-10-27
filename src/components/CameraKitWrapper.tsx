@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { bootstrapCameraKit, createMediaStreamSource, Transform2D, createImageSource, createVideoSource } from '@snap/camera-kit';
+import { bootstrapCameraKit, createMediaStreamSource, Transform2D } from '@snap/camera-kit';
 import { CAMERAKIT_CONFIG } from '../config/camerakit';
 
 export const CameraKitWrapper = () => {
@@ -7,6 +7,7 @@ export const CameraKitWrapper = () => {
     const canvasRef = useRef<HTMLCanvasElement>(null)
     const sessionRef = useRef<any>(null);
     const cameraKitRef = useRef<any>(null);
+    const sourceRef = useRef<any>(null);
     // Media Stream Ref
     const streamRef = useRef<MediaStream | null>(null);
     const [error, setError] = useState<string | null>(null);
@@ -20,7 +21,6 @@ export const CameraKitWrapper = () => {
     const [isUsingCamera, setIsUsingCamera] = useState(true);
     const [isRecording, setIsRecording] = useState(false);
     const [recordedVideoUrl, setRecordedVideoUrl] = useState<string | null>(null);
-    const fileInputRef = useRef<HTMLInputElement>(null);
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
     const recordingChunksRef = useRef<Blob[]>([]);
     const holdTimerRef = useRef<any>(null);
@@ -37,6 +37,42 @@ export const CameraKitWrapper = () => {
     }, []);
 
 
+    // Helper to dynamically match CameraKit render resolution to the viewport/canvas aspect ratio
+    const updateSourceRenderSize = async (sourceToUpdate?: any) => {
+        const activeSource = sourceToUpdate || sourceRef.current;
+        if (!activeSource || !canvasRef.current) return;
+
+        const rect = canvasRef.current.getBoundingClientRect();
+        const viewWidth = rect.width || window.innerWidth;
+        const viewHeight = rect.height || window.innerHeight;
+        if (viewWidth <= 0 || viewHeight <= 0) return;
+
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const maxLongEdge = 1920;
+        const isPortrait = viewHeight >= viewWidth;
+        const aspect = viewWidth / viewHeight;
+
+        let renderWidth = Math.round(viewWidth * dpr);
+        let renderHeight = Math.round(viewHeight * dpr);
+
+        if (isPortrait) {
+            renderHeight = Math.min(Math.max(renderHeight, 1280), maxLongEdge);
+            renderWidth = Math.round(renderHeight * aspect);
+        } else {
+            renderWidth = Math.min(Math.max(renderWidth, 1280), maxLongEdge);
+            renderHeight = Math.round(renderWidth / aspect);
+        }
+
+        // Ensure even dimensions for WebGL / video encoders
+        renderWidth = renderWidth - (renderWidth % 2);
+        renderHeight = renderHeight - (renderHeight % 2);
+
+        try {
+            await activeSource.setRenderSize(renderWidth, renderHeight);
+        } catch (err) {
+            console.warn('Failed to update render size:', err);
+        }
+    };
     //@ts-ignore
     // Handle lens selection
     const handleSelectLens = (lensId: string) => {
@@ -49,100 +85,6 @@ export const CameraKitWrapper = () => {
         setFacingMode(prev => prev === 'user' ? 'environment' : 'user');
     };
 
-    // Handle Gallery selection
-    const handleGalleryClick = () => {
-        fileInputRef.current?.click();
-    };
-
-    const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
-        const file = event.target.files?.[0];
-        if (!file || !sessionRef.current) return;
-
-        setIsUsingCamera(false);
-        setIsLoading(true);
-
-        try {
-            // Stop previous camera stream if it exists
-            if (streamRef.current) {
-                streamRef.current.getTracks().forEach(track => track.stop());
-                streamRef.current = null;
-            }
-
-            const url = URL.createObjectURL(file);
-
-            if (file.type.startsWith('image/')) {
-                const img = new Image();
-                img.crossOrigin = "anonymous";
-                img.src = url;
-
-                await new Promise((resolve, reject) => {
-                    img.onload = resolve;
-                    img.onerror = reject;
-                });
-
-                const imageSource = await createImageSource(img);
-                await sessionRef.current.setSource(imageSource.copy());
-                await sessionRef.current.play();
-
-            } else if (file.type.startsWith('video/')) {
-                const video = document.createElement('video');
-                // Set these BEFORE src for better mobile compatibility
-                video.muted = true;
-                video.loop = true;
-                video.playsInline = true;
-                (video as any).webkitPlaysInline = true; // For older iOS browsers
-                video.crossOrigin = "anonymous";
-                video.src = url;
-
-                await new Promise((resolve, reject) => {
-                    // canplaythrough is more reliable for mobile to ensure enough data is buffered
-                    video.oncanplaythrough = resolve;
-                    video.onloadedmetadata = () => {
-                        // Ensure dimensions are captured as soon as they are available
-                        resolve(null);
-                    };
-                    video.onerror = (e) => {
-                        console.error('Video element error:', e);
-                        reject(new Error('Failed to load video file'));
-                    };
-
-                    // Cleanup timeout for mobile
-                    setTimeout(() => resolve(null), 5000);
-                });
-
-                // Optimization for mobile: scale down high-res videos
-                const MAX_DIMENSION = 1280;
-                if (video.videoWidth > 0 && (video.videoWidth > MAX_DIMENSION || video.videoHeight > MAX_DIMENSION)) {
-                    const scale = MAX_DIMENSION / Math.max(video.videoWidth, video.videoHeight);
-                    video.width = video.videoWidth * scale;
-                    video.height = video.videoHeight * scale;
-                } else if (video.videoWidth > 0) {
-                    video.width = video.videoWidth;
-                    video.height = video.videoHeight;
-                }
-
-                // Attempt to play, catching potential autoplay errors
-                try {
-                    await video.play();
-                } catch (e) {
-                    console.warn('Autoplay prevented, retrying after interaction if needed', e);
-                }
-
-                const videoSource = createVideoSource(video);
-                await sessionRef.current.setSource(videoSource.copy());
-                await sessionRef.current.play();
-            } else {
-                throw new Error('Unsupported file type');
-            }
-
-            setIsLoading(false);
-        } catch (err: any) {
-            console.error('Gallery Error:', err);
-            setError(err.message || 'Failed to load gallery media');
-            setIsLoading(false);
-            setIsUsingCamera(true); // Revert to camera on error
-        }
-    };
     // Handle take photo / record video
     const handleShutterDown = () => {
         // Start a timer to detect long press (hold)
@@ -300,8 +242,14 @@ export const CameraKitWrapper = () => {
                     streamRef.current.getTracks().forEach(track => track.stop());
                 }
 
+                // Request 16:9 HD camera stream so the sensor provides a wide/tall uncropped field of view
                 const stream = await navigator.mediaDevices.getUserMedia({
-                    video: { facingMode: facingMode }
+                    video: {
+                        facingMode: facingMode,
+                        width: { ideal: 1920 },
+                        height: { ideal: 1080 },
+                    },
+                    audio: false,
                 });
 
                 if (!isMounted) {
@@ -316,9 +264,10 @@ export const CameraKitWrapper = () => {
                     cameraType: facingMode
                 });
 
-                await sessionRef.current.setSource(source);
+                const attachedSource = await sessionRef.current.setSource(source);
+                sourceRef.current = attachedSource;
                 await sessionRef.current.play();
-                await source.setRenderSize(1080, 1920);
+                await updateSourceRenderSize(attachedSource);
 
                 // Don't hide loader here - let the lens application effect handle it
                 // so the loader stays visible until the lens is fully applied
@@ -329,9 +278,16 @@ export const CameraKitWrapper = () => {
         };
 
         initStream();
+
+        const handleResize = () => {
+            updateSourceRenderSize();
+        };
+        window.addEventListener('resize', handleResize);
+
         // Cleanup on unmount
         return () => {
             isMounted = false;
+            window.removeEventListener('resize', handleResize);
             // Stop stream
             if (streamRef.current) {
                 streamRef.current.getTracks().forEach(track => track.stop());
@@ -399,7 +355,7 @@ export const CameraKitWrapper = () => {
 
     return (
         // Camera Container
-        <div className="relative w-screen h-screen bg-black overflow-hidden select-none">
+        <div className="relative w-screen h-dvh bg-black overflow-hidden select-none">
             <canvas
                 ref={canvasRef}
                 id="CameraKit-AR-Canvas"
@@ -458,17 +414,7 @@ export const CameraKitWrapper = () => {
                                 REC
                             </div>
                         )}
-                        <div className="grid grid-cols-[1fr_auto_1fr] items-center w-full max-w-[440px] px-5 gap-5">
-                            <button
-                                className="w-12 h-12 p-0 rounded-full bg-black/40 backdrop-blur-md border-none flex items-center justify-center text-white cursor-pointer transition-all active:scale-95"
-                                aria-label="Gallery"
-                                onClick={handleGalleryClick}
-                            >
-                                <svg viewBox="0 0 24 24" className="w-6 h-6 fill-current">
-                                    <path d="M22 16V4c0-1.1-.9-2-2-2H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2zm-11-4l2.03 2.71L16 11l4 5H8l3-4zM2 6v14c0 1.1.9 2 2 2h14v-2H4V6H2z" />
-                                </svg>
-                            </button>
-
+                        <div className="flex items-center justify-center w-full max-w-[440px] px-5">
                             <button
                                 className={`relative w-[76px] h-[76px] p-0 rounded-full border-[3px] flex items-center justify-center cursor-pointer transition-all duration-200 backdrop-blur-[2px] active:scale-90 ${isRecording ? 'border-red-500 bg-red-500/20 shadow-[0_0_0_8px_rgba(255,75,43,0.3)] animate-recordingRipple' : 'border-white/90 bg-white/10 after:content-[""] after:absolute after:inset-0 after:border-2 after:border-white/80 after:rounded-full after:animate-idleRipple'
                                     }`}
@@ -481,19 +427,8 @@ export const CameraKitWrapper = () => {
                                 <div className={`transition-all duration-300 transform-gpu ${isRecording ? 'w-6 h-6 bg-red-500 rounded-sm' : 'w-[60px] h-[60px] bg-white rounded-full shadow-[0_4px_12px_rgba(0,0,0,0.2)]'
                                     }`} />
                             </button>
-
-                            <div className="w-full" />
                         </div>
                     </div>
-
-                    {/* Hidden File Input */}
-                    <input
-                        type="file"
-                        ref={fileInputRef}
-                        className="hidden"
-                        accept="image/*,video/*"
-                        onChange={handleFileChange}
-                    />
                 </div>
             ) : null}
         </div>
